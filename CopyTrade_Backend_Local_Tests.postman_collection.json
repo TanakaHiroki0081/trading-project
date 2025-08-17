@@ -1,0 +1,140 @@
+{
+  "info": {
+    "name": "CopyTrade Backend – Local Tests",
+    "_postman_id": "5e13a586-bb9e-4486-a525-ac3fe6958269",
+    "description": "Requests to test your FastAPI endpoints: /health, /recent, and /events with OPEN/MODIFY/CLOSE payloads.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const json = pm.response.json();",
+              "pm.test('Contains status ok', function () { pm.expect(json.status).to.eql('ok'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Recent (last 5)",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/recent?limit=5"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "pm.test('Body is an array', function () { pm.expect(pm.response.json()).to.be.an('array'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Event – OPEN",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ticket\": 100001,\n  \"symbol\": \"USDJPY\",\n  \"volume\": 0.01,\n  \"sl\": 145.5,\n  \"tp\": 144.0,\n  \"type\": 1,\n  \"magic\": 123456,\n  \"comment\": \"Test OPEN\",\n  \"action\": \"OPEN\"\n}"
+        },
+        "url": "{{baseUrl}}/events"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const json = pm.response.json();",
+              "pm.test('ok true', function () { pm.expect(json.ok).to.be.true; });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Event – MODIFY",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ticket\": 100001,\n  \"symbol\": \"USDJPY\",\n  \"volume\": 0.02,\n  \"sl\": 145.8,\n  \"tp\": 143.5,\n  \"type\": 1,\n  \"magic\": 123456,\n  \"comment\": \"Test MODIFY\",\n  \"action\": \"MODIFY\"\n}"
+        },
+        "url": "{{baseUrl}}/events"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const json = pm.response.json();",
+              "pm.test('ok true', function () { pm.expect(json.ok).to.be.true; });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Event – CLOSE",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ticket\": 100001,\n  \"symbol\": \"USDJPY\",\n  \"volume\": 0.0,\n  \"sl\": 0.0,\n  \"tp\": 0.0,\n  \"type\": 1,\n  \"magic\": 123456,\n  \"comment\": \"Test CLOSE\",\n  \"action\": \"CLOSE\"\n}"
+        },
+        "url": "{{baseUrl}}/events"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+              "const json = pm.response.json();",
+              "pm.test('ok true', function () { pm.expect(json.ok).to.be.true; });"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    }
+  ]
+}

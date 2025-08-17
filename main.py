@@ -58,16 +58,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.post("/events")
 async def receive_event(evt: PositionEvent, request: Request):
-    # Log & (optionally) fan out to WS subscribers
     raw_body = await request.body()
-    print("[DEBUG] Received raw JSON from MQL5:", raw_body.decode(errors='replace'))
-    print(f"[{datetime.utcnow().isoformat()}] {evt.action} {evt.symbol} "
-          f"lot={evt.volume} ticket={evt.ticket} magic={evt.magic} comment='{evt.comment}'")
-    try:
-        # Optional broadcast to slaves that are connected via WS
-        await hub.broadcast(evt.model_dump_json())
-    except Exception as e:
-        print("Broadcast error:", e)
+    print("[DEBUG] Raw JSON from Capture EA:", raw_body.decode(errors='replace'))
+    print("[DEBUG] Parsed event:", evt)
     return {"ok": True}
 
 @app.websocket("/ws")

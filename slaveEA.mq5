@@ -1,190 +1,246 @@
 //+------------------------------------------------------------------+
-//|                                                      SlaveEA.mq5 |
-//|        Connects to backend and executes trades from Master       |
+//|                                                      SlaveEA_WSbridge.mq5 |
+//|  Slave EA that gets near-real-time events via a local bridge HTTP endpoint |
 //+------------------------------------------------------------------+
 #property strict
 
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
 #include <stdlib.mqh>
 
 //--- Settings
-input string BACKEND_URL = "http://127.0.0.1:8000/recent"; // You may create this endpoint to return recent events
-input double LOT_MULTIPLIER = 1.0;  // Adjust master lot size if needed
-input int POLL_INTERVAL = 2;         // seconds
+input string BRIDGE_URL = "http://127.0.0.1:9000/events"; // local bridge
+input double LOT_MULTIPLIER = 1.0;  // multiply master lots
+input int POLL_INTERVAL = 1;        // seconds between polls (bridge is long-polling)
+input int WEBREQUEST_TIMEOUT = 35000; // ms
+input int SLAVE_MAGIC = 9999;       // magic for slave orders
 
-//--- Keep track of executed trades to avoid duplicates
-ulong executedTickets[];
+//--- State
+ulong processedTickets[];  // tickets already processed
 
-//--- Convert UTF-8 char array to string
-string CharArrayToStr(uchar &data[])
+//--- Helpers
+void StringToUtf8(string s, uchar &out[])
 {
-   return(CharArrayToString(data, 0, WHOLE_ARRAY, CP_UTF8));
+   int len = StringToCharArray(s, out, 0, WHOLE_ARRAY, CP_UTF8);
+   if(len>0) ArrayResize(out, len-1); // remove null term
 }
 
-//--- Utility: check if ticket already executed
-bool IsExecuted(ulong ticket)
+string CharArrayToUtf8String(uchar &arr[])
 {
-   for(int i=0; i<ArraySize(executedTickets); i++)
-      if(executedTickets[i] == ticket) return true;
+   return(CharArrayToString(arr, 0, WHOLE_ARRAY, CP_UTF8));
+}
+
+bool IsProcessed(ulong ticket)
+{
+   for(int i=0;i<ArraySize(processedTickets);i++)
+      if(processedTickets[i]==ticket) return true;
    return false;
 }
 
-//--- Execute trade
-void ExecuteTrade(string action, string symbol, double volume, double sl, double tp, int type, ulong ticket)
+void MarkProcessed(ulong ticket)
 {
-   double adjVolume = volume * LOT_MULTIPLIER;
-   if(action == "OPEN")
+   if(!IsProcessed(ticket))
    {
-      int orderType = type; // 0=BUY,1=SELL in your master EA
-      MqlTradeRequest request;
-      MqlTradeResult result;
-      ZeroMemory(request);
-      ZeroMemory(result);
-
-      request.action   = TRADE_ACTION_DEAL;
-      request.symbol   = symbol;
-      request.volume   = adjVolume;
-      request.type     = orderType;
-      request.price    = (orderType==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
-      request.sl       = sl;
-      request.tp       = tp;
-      request.magic    = 9999; // Set slave magic number
-      request.comment  = "Slave copy";
-
-      if(!OrderSend(request,result))
-         Print("❌ Failed to open ", symbol, " ticket=", ticket, " err=",GetLastError());
-      else
-         Print("✅ Opened ", symbol, " ticket=", ticket, " result:", result.retcode);
-   }
-   else if(action == "CLOSE")
-   {
-      // Find position by ticket
-      if(PositionSelectByTicket(ticket))
-      {
-         double closeVolume = PositionGetDouble(POSITION_VOLUME);
-         MqlTradeRequest request;
-         MqlTradeResult result;
-         ZeroMemory(request);
-         ZeroMemory(result);
-
-         request.action   = TRADE_ACTION_DEAL;
-         request.position = ticket;
-         request.symbol   = symbol;
-         request.volume   = closeVolume;
-         request.type     = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.price    = (request.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
-         request.magic    = 9999;
-         request.comment  = "Slave copy";
-
-         if(!OrderSend(request,result))
-            Print("❌ Failed to close ", symbol, " ticket=", ticket, " err=",GetLastError());
-         else
-            Print("✅ Closed ", symbol, " ticket=", ticket, " result:", result.retcode);
-      }
-   }
-   else if(action == "MODIFY")
-   {
-      if(PositionSelectByTicket(ticket))
-      {
-         double currentSL = PositionGetDouble(POSITION_SL);
-         double currentTP = PositionGetDouble(POSITION_TP);
-
-         if(currentSL != sl || currentTP != tp)
-         {
-            MqlTradeRequest request;
-            MqlTradeResult result;
-            ZeroMemory(request);
-            ZeroMemory(result);
-
-            request.action   = TRADE_ACTION_SLTP;
-            request.position = ticket;
-            request.sl       = sl;
-            request.tp       = tp;
-
-            if(!OrderSend(request,result))
-               Print("❌ Failed to modify ", symbol, " ticket=", ticket, " err=",GetLastError());
-            else
-               Print("✅ Modified ", symbol, " ticket=", ticket, " result:", result.retcode);
-         }
-      }
-   }
-   // Record executed ticket to avoid re-processing
-   if(!IsExecuted(ticket))
-   {
-      ArrayResize(executedTickets,ArraySize(executedTickets)+1);
-      executedTickets[ArraySize(executedTickets)-1] = ticket;
+      ArrayResize(processedTickets, ArraySize(processedTickets)+1);
+      processedTickets[ArraySize(processedTickets)-1] = ticket;
    }
 }
 
-//--- Poll backend for recent trades
-void PollBackend()
+//--- Minimal JSON parsing helpers (robust lib recommended for production)
+string json_get_string_field(const string json,const string key)
+{
+   string pattern = "\"" + key + "\":";
+   int pos = StringFind(json, pattern);
+   if(pos==-1) return("");
+   pos += StringLen(pattern);
+   // skip whitespace and optional quote
+   while(pos < StringLen(json) && (StringGetCharacter(json,pos)==32 || StringGetCharacter(json,pos)==9)) pos++;
+   if(StringGetCharacter(json,pos)=='"')
+   {
+      pos++; int start=pos;
+      while(pos < StringLen(json) && StringGetCharacter(json,pos)!='"') pos++;
+      return StringSubstr(json, start, pos-start);
+   }
+   // not a quoted string; read until comma or brace
+   int end = StringFind(json, ",", pos);
+   if(end==-1) end = StringFind(json, "}", pos);
+   if(end==-1) end = StringLen(json);
+   return StringSubstr(json, pos, end-pos);
+}
+
+double json_get_number_field(const string json,const string key)
+{
+   string s = json_get_string_field(json,key);
+   if(s=="") return 0.0;
+   return StringToDouble(s);
+}
+
+long json_get_int_field(const string json,const string key)
+{
+   string s = json_get_string_field(json,key);
+   if(s=="") return 0;
+   return (long)StringToInteger(s);
+}
+
+//--- Trade actions
+void HandleEvent(const string raw_event)
+{
+   // raw_event is a JSON object string
+   // Extract fields
+   ulong ticket = (ulong)json_get_int_field(raw_event,"ticket");
+   string symbol = json_get_string_field(raw_event,"symbol");
+   double volume = json_get_number_field(raw_event,"volume");
+   double sl = json_get_number_field(raw_event,"sl");
+   double tp = json_get_number_field(raw_event,"tp");
+   int type = (int)json_get_int_field(raw_event,"type"); // 0=buy,1=sell
+   string action = json_get_string_field(raw_event,"action");
+
+   if(IsProcessed(ticket) && action=="OPEN")
+      return;
+
+   double adjVol = volume * LOT_MULTIPLIER;
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   if(action=="OPEN")
+   {
+      req.action = TRADE_ACTION_DEAL;
+      req.symbol = symbol;
+      req.volume = NormalizeDouble(adjVol,2); // adjust precision if needed
+      req.type = (type==0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      req.price = (req.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
+      req.sl = sl;
+      req.tp = tp;
+      req.magic = SLAVE_MAGIC;
+      req.deviation = 10;
+      req.comment = "Slave copy";
+      if(!OrderSend(req,res))
+         PrintFormat("Failed OrderSend OPEN: err=%d res=%d", GetLastError(), res.retcode);
+      else
+      {
+         PrintFormat("Opened symbol=%s ticket=%I64u master_ticket=%I64u ret=%d", symbol, (ulong)res.order, ticket, res.retcode);
+         MarkProcessed(ticket);
+      }
+   }
+   else if(action=="CLOSE")
+   {
+      // Try to close positions matching master ticket by comment/magic/symbol
+      for(int i=PositionsTotal()-1;i>=0;i--)
+      {
+         if(PositionSelectByIndex(i))
+         {
+            string psym = PositionGetString(POSITION_SYMBOL);
+            long pmagic = PositionGetInteger(POSITION_MAGIC);
+            ulong p_ticket = PositionGetInteger(POSITION_TICKET);
+            if(psym==symbol && pmagic==SLAVE_MAGIC)
+            {
+               ZeroMemory(req); ZeroMemory(res);
+               req.action = TRADE_ACTION_DEAL;
+               req.position = p_ticket;
+               long ptype = PositionGetInteger(POSITION_TYPE);
+               req.type = (ptype==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+               req.volume = PositionGetDouble(POSITION_VOLUME);
+               req.symbol = symbol;
+               req.price = (req.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
+               req.deviation = 10;
+               req.comment = "Slave close";
+               req.magic = SLAVE_MAGIC;
+               if(!OrderSend(req,res))
+                  PrintFormat("Failed OrderSend CLOSE: err=%d ret=%d", GetLastError(), res.retcode);
+               else
+                  PrintFormat("Closed slave pos %I64u for symbol=%s ret=%d", p_ticket, symbol, res.retcode);
+            }
+         }
+      }
+      MarkProcessed(ticket);
+   }
+   else if(action=="MODIFY")
+   {
+      for(int i=PositionsTotal()-1;i>=0;i--)
+      {
+         if(PositionSelectByIndex(i))
+         {
+            string psym = PositionGetString(POSITION_SYMBOL);
+            long pmagic = PositionGetInteger(POSITION_MAGIC);
+            ulong p_ticket = PositionGetInteger(POSITION_TICKET);
+            if(psym==symbol && pmagic==SLAVE_MAGIC)
+            {
+               double curSL = PositionGetDouble(POSITION_SL);
+               double curTP = PositionGetDouble(POSITION_TP);
+               if(curSL!=sl || curTP!=tp)
+               {
+                  ZeroMemory(req); ZeroMemory(res);
+                  req.action = TRADE_ACTION_SLTP;
+                  req.position = p_ticket;
+                  req.sl = sl;
+                  req.tp = tp;
+                  if(!OrderSend(req,res))
+                     PrintFormat("Failed modify pos %I64u err=%d ret=%d", p_ticket, GetLastError(), res.retcode);
+                  else
+                     PrintFormat("Modified pos %I64u ret=%d", p_ticket, res.retcode);
+               }
+            }
+         }
+      }
+      MarkProcessed(ticket);
+   }
+}
+
+//--- Poll bridge (long-poll)
+void PollBridge()
 {
    uchar post[], result[];
+   string headers = "Content-Type: application/json";
    string result_headers;
-
    ResetLastError();
-   int res = WebRequest("GET", BACKEND_URL, "", 5000, post, result, result_headers);
+
+   int res = WebRequest("GET", BRIDGE_URL, headers, WEBREQUEST_TIMEOUT, post, result, result_headers);
    if(res == -1)
    {
-      PrintFormat("❌ WebRequest failed: %d", GetLastError());
+      PrintFormat("WebRequest failed: %d. Check Allowed URLs in MT5 options for: %s", GetLastError(), BRIDGE_URL);
       return;
    }
 
-   string response = CharArrayToStr(result);
-   // Expected: response is JSON list of trade events
-   // Example: [{"ticket":123,"symbol":"EURUSD","volume":0.1,"sl":1.1,"tp":1.2,"type":0,"magic":1,"comment":"x","action":"OPEN"}, ...]
-   if(StringLen(response) > 0)
-   {
-      int arrSize = 0;
-      // Parse simple JSON manually (you may use JSON.mqh library for robustness)
-      // For simplicity here, use StringSplit by '{' and '}'
-      string items[];
-      arrSize = StringSplit(response, '{', items);
-      for(int i=1;i<arrSize;i++) // skip first empty
-      {
-         string s = "{" + items[i];
-         // Extract fields
-         ulong ticket = StringToInteger(StringGetField(s,"ticket"));
-         string symbol = StringGetField(s,"symbol");
-         double volume = StringToDouble(StringGetField(s,"volume"));
-         double sl     = StringToDouble(StringGetField(s,"sl"));
-         double tp     = StringToDouble(StringGetField(s,"tp"));
-         int type      = StringToInteger(StringGetField(s,"type"));
-         string action = StringGetField(s,"action");
+   string response = CharArrayToUtf8String(result);
+   if(StringLen(response) == 0) return;
 
-         if(!IsExecuted(ticket))
-            ExecuteTrade(action,symbol,volume,sl,tp,type,ticket);
-      }
+   // Look for '"events":[' and extract the array
+   int pos = StringFind(response, "\"events\":[");
+   if(pos == -1) return;
+   pos += StringLen("\"events\":[");
+   int end = StringFind(response, "]", pos);
+   if(end == -1) return;
+   string events_str = StringSubstr(response, pos, end-pos);
+
+   // Split by '},{' to get each object
+   string items[];
+   int cnt = StringSplit(events_str, "},{", items);
+   for(int i=0;i<cnt;i++)
+   {
+      string item = items[i];
+      if(i != cnt-1) item = item + "}"; // add closing brace except for last
+      if(i != 0) item = "{" + item;     // add opening brace except for first
+      HandleEvent(item);
    }
 }
 
-//--- Initialization
+//--- Timer
 int OnInit()
 {
-   Print("Slave EA started");
+   Print("SlaveEA_WSbridge started");
    EventSetTimer(POLL_INTERVAL);
    return(INIT_SUCCEEDED);
 }
 
-//--- Timer tick
 void OnTimer()
 {
-   PollBackend();
+   PollBridge();
 }
 
-//--- Deinitialization
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   Print("Slave EA stopped");
-}
-
-//--- Simple helper to extract JSON field (very basic)
-string StringGetField(string json, string key)
-{
-   int pos = StringFind(json, "\"" + key + "\":");
-   if(pos == -1) return "";
-   int start = pos + StringLen(key) + 3; // skip key+quotes+colon
-   int end = StringFind(json, ",", start);
-   if(end == -1) end = StringFind(json, "}", start);
-   return StringSubstr(json,start,end-start);
+   Print("SlaveEA_WSbridge stopped");
 }

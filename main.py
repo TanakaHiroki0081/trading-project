@@ -1,108 +1,54 @@
-# backend.py
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import List
+from models import PositionData
 import asyncio
 import json
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from fastapi import status
-from pydantic import BaseModel
-from datetime import datetime, timezone
-from pydantic import Field
 
-app = FastAPI()
+app = FastAPI(title="Copy Trading Backend")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-connected_slaves: List[WebSocket] = []
-
-class PositionEventIn(BaseModel):
-    ticket: int
-    symbol: str
-    volume: float
-    sl: float
-    tp: float
-    type: int
-    magic: int
-    comment: str
-    action: str  # or Literal["OPEN", "MODIFY", "CLOSE"]
-
-class PositionEventOut(PositionEventIn):
-    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-recent_events: List[PositionEventOut] = []
-
-class Hub:
+# === Slave Connection Management ===
+class ConnectionManager:
     def __init__(self):
-        self._clients = set()
-    async def broadcast_json(self, data):
-        # Placeholder: In production, send data to all connected WebSocket clients
-        print("[DEBUG] Broadcasting to clients:", data)
+        self.active_connections: List[WebSocket] = []
 
-hub = Hub()
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"Slave connected. Total slaves: {len(self.active_connections)}")
 
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        print(f"Slave disconnected. Total slaves: {len(self.active_connections)}")
+
+    async def broadcast(self, message: str):
+        disconnected = []
+        for conn in self.active_connections:
+            try:
+                await conn.send_text(message)
+            except:
+                disconnected.append(conn)
+        for dc in disconnected:
+            self.disconnect(dc)
+
+manager = ConnectionManager()
+
+# === WebSocket endpoint for Slaves ===
 @app.websocket("/ws/slave")
-async def slave_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connected_slaves.append(websocket)
-    print("✅ Slave connected. Total:", len(connected_slaves))
+async def websocket_slave(websocket: WebSocket):
+    await manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_json()
-            print(f"ACK from slave: {data}")
+            # Optionally receive messages from slaves
+            msg = await websocket.receive_text()
+            print(f"Received from slave: {msg}")
     except WebSocketDisconnect:
-        connected_slaves.remove(websocket)
-        print("❌ Slave disconnected. Remaining:", len(connected_slaves))
+        manager.disconnect(websocket)
 
-async def broadcast_trade(trade: dict):
-    disconnected = []
-    for slave in connected_slaves:
-        try:
-            await slave.send_json(trade)
-        except:
-            disconnected.append(slave)
-    for s in disconnected:
-        connected_slaves.remove(s)
-
+# === HTTP endpoint for Master EA ===
 @app.post("/events")
-async def receive_event(evt: PositionEventIn, request: Request):
-    try:
-        raw = (await request.body()).decode(errors="replace")
-        print("[DEBUG] /events raw request body:", raw)
-    except Exception as e:
-        print("[DEBUG] Could not read body in /events:", e)
-    out = PositionEventOut(**evt.model_dump())
-    recent_events.append(out)
-    # Log compact line
-    print(
-        f"[{out.ts.isoformat()}] {out.action} {out.symbol} "
-        f"lot={out.volume} ticket={out.ticket} magic={out.magic} comment='{out.comment}'"
-    )
-    # Fan out to live clients
-    await hub.broadcast_json(out.model_dump())
-    return {"ok": True}
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    raw = None
-    try:
-        raw = (await request.body()).decode(errors="replace")
-        print("[DEBUG] Raw request body:", raw)
-    except Exception as e:
-        print("[DEBUG] Could not read body:", e)
-    print("[DEBUG] Validation error details:", exc.errors())
-    print("[DEBUG] Validation error body:", exc.body)
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors(), "body": raw},
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+async def receive_trade(trade: PositionData):
+    trade_json = trade.json()
+    print(f"Received trade from Master EA: {trade_json}")
+    # Broadcast to all connected slaves
+    await manager.broadcast(trade_json)
+    return {"status": "success", "message": "Trade broadcasted to slaves"}

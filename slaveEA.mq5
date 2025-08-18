@@ -1,125 +1,190 @@
 //+------------------------------------------------------------------+
-//|                                                SlaveEA_HTTP.mq5 |
-//|   Polls backend for trade signals (JSON) and executes them       |
+//|                                                      SlaveEA.mq5 |
+//|        Connects to backend and executes trades from Master       |
 //+------------------------------------------------------------------+
 #property strict
 
-input string BACKEND_URL = "http://127.0.0.1:8000/poll";  // REST polling endpoint
+#include <stdlib.mqh>
+
+//--- Settings
+input string BACKEND_URL = "http://127.0.0.1:8000/recent"; // You may create this endpoint to return recent events
+input double LOT_MULTIPLIER = 1.0;  // Adjust master lot size if needed
+input int POLL_INTERVAL = 2;         // seconds
+
+//--- Keep track of executed trades to avoid duplicates
+ulong executedTickets[];
+
+//--- Convert UTF-8 char array to string
+string CharArrayToStr(uchar &data[])
+{
+   return(CharArrayToString(data, 0, WHOLE_ARRAY, CP_UTF8));
+}
+
+//--- Utility: check if ticket already executed
+bool IsExecuted(ulong ticket)
+{
+   for(int i=0; i<ArraySize(executedTickets); i++)
+      if(executedTickets[i] == ticket) return true;
+   return false;
+}
+
+//--- Execute trade
+void ExecuteTrade(string action, string symbol, double volume, double sl, double tp, int type, ulong ticket)
+{
+   double adjVolume = volume * LOT_MULTIPLIER;
+   if(action == "OPEN")
+   {
+      int orderType = type; // 0=BUY,1=SELL in your master EA
+      MqlTradeRequest request;
+      MqlTradeResult result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action   = TRADE_ACTION_DEAL;
+      request.symbol   = symbol;
+      request.volume   = adjVolume;
+      request.type     = orderType;
+      request.price    = (orderType==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
+      request.sl       = sl;
+      request.tp       = tp;
+      request.magic    = 9999; // Set slave magic number
+      request.comment  = "Slave copy";
+
+      if(!OrderSend(request,result))
+         Print("❌ Failed to open ", symbol, " ticket=", ticket, " err=",GetLastError());
+      else
+         Print("✅ Opened ", symbol, " ticket=", ticket, " result:", result.retcode);
+   }
+   else if(action == "CLOSE")
+   {
+      // Find position by ticket
+      if(PositionSelectByTicket(ticket))
+      {
+         double closeVolume = PositionGetDouble(POSITION_VOLUME);
+         MqlTradeRequest request;
+         MqlTradeResult result;
+         ZeroMemory(request);
+         ZeroMemory(result);
+
+         request.action   = TRADE_ACTION_DEAL;
+         request.position = ticket;
+         request.symbol   = symbol;
+         request.volume   = closeVolume;
+         request.type     = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         request.price    = (request.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
+         request.magic    = 9999;
+         request.comment  = "Slave copy";
+
+         if(!OrderSend(request,result))
+            Print("❌ Failed to close ", symbol, " ticket=", ticket, " err=",GetLastError());
+         else
+            Print("✅ Closed ", symbol, " ticket=", ticket, " result:", result.retcode);
+      }
+   }
+   else if(action == "MODIFY")
+   {
+      if(PositionSelectByTicket(ticket))
+      {
+         double currentSL = PositionGetDouble(POSITION_SL);
+         double currentTP = PositionGetDouble(POSITION_TP);
+
+         if(currentSL != sl || currentTP != tp)
+         {
+            MqlTradeRequest request;
+            MqlTradeResult result;
+            ZeroMemory(request);
+            ZeroMemory(result);
+
+            request.action   = TRADE_ACTION_SLTP;
+            request.position = ticket;
+            request.sl       = sl;
+            request.tp       = tp;
+
+            if(!OrderSend(request,result))
+               Print("❌ Failed to modify ", symbol, " ticket=", ticket, " err=",GetLastError());
+            else
+               Print("✅ Modified ", symbol, " ticket=", ticket, " result:", result.retcode);
+         }
+      }
+   }
+   // Record executed ticket to avoid re-processing
+   if(!IsExecuted(ticket))
+   {
+      ArrayResize(executedTickets,ArraySize(executedTickets)+1);
+      executedTickets[ArraySize(executedTickets)-1] = ticket;
+   }
+}
+
+//--- Poll backend for recent trades
+void PollBackend()
+{
+   uchar post[], result[];
+   string result_headers;
+
+   ResetLastError();
+   int res = WebRequest("GET", BACKEND_URL, "", 5000, post, result, result_headers);
+   if(res == -1)
+   {
+      PrintFormat("❌ WebRequest failed: %d", GetLastError());
+      return;
+   }
+
+   string response = CharArrayToStr(result);
+   // Expected: response is JSON list of trade events
+   // Example: [{"ticket":123,"symbol":"EURUSD","volume":0.1,"sl":1.1,"tp":1.2,"type":0,"magic":1,"comment":"x","action":"OPEN"}, ...]
+   if(StringLen(response) > 0)
+   {
+      int arrSize = 0;
+      // Parse simple JSON manually (you may use JSON.mqh library for robustness)
+      // For simplicity here, use StringSplit by '{' and '}'
+      string items[];
+      arrSize = StringSplit(response, '{', items);
+      for(int i=1;i<arrSize;i++) // skip first empty
+      {
+         string s = "{" + items[i];
+         // Extract fields
+         ulong ticket = StringToInteger(StringGetField(s,"ticket"));
+         string symbol = StringGetField(s,"symbol");
+         double volume = StringToDouble(StringGetField(s,"volume"));
+         double sl     = StringToDouble(StringGetField(s,"sl"));
+         double tp     = StringToDouble(StringGetField(s,"tp"));
+         int type      = StringToInteger(StringGetField(s,"type"));
+         string action = StringGetField(s,"action");
+
+         if(!IsExecuted(ticket))
+            ExecuteTrade(action,symbol,volume,sl,tp,type,ticket);
+      }
+   }
+}
 
 //--- Initialization
 int OnInit()
 {
-   EventSetTimer(2); // poll every 2 seconds
-   Print("✅ Slave EA started (HTTP polling). Make sure URL is allowed in MT5 Options.");
+   Print("Slave EA started");
+   EventSetTimer(POLL_INTERVAL);
    return(INIT_SUCCEEDED);
 }
 
+//--- Timer tick
+void OnTimer()
+{
+   PollBackend();
+}
+
+//--- Deinitialization
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   Print("❌ Slave EA stopped");
+   Print("Slave EA stopped");
 }
 
-//--- Timer: poll backend
-void OnTimer()
+//--- Simple helper to extract JSON field (very basic)
+string StringGetField(string json, string key)
 {
-   uchar data[];        // empty body for GET request
-   uchar result[];      // response will be stored here
-   string headers;      // response headers will be stored here
-
-   int status = WebRequest("GET", BACKEND_URL, "", 5000, data, result, headers);
-
-   if(status == -1)
-   {
-      Print("⚠️ WebRequest failed. Did you allow URL in MT5? ", BACKEND_URL,
-            " (Tools → Options → Expert Advisors → Allow WebRequest)");
-      return;
-   }
-
-   string response = "";
-   if(ArraySize(result) > 0)
-      response = CharArrayToString(result);
-
-   if(StringLen(response) > 2) // avoid empty {}
-   {
-      Print("📥 Received trade JSON: ", response);
-      ExecuteTrade(response);
-   }
-}
-
-//--- Simple JSON helper: extract value by key
-string GetJsonValue(string json, string key)
-{
-   string pattern = "\"" + key + "\":";
-   int start = StringFind(json, pattern);
-   if(start == -1) return("");
-
-   start += StringLen(pattern);
-
-   // check if value is string (inside quotes)
-   if(StringGetCharacter(json, start) == '\"')
-   {
-      start++;
-      int end = StringFind(json, "\"", start);
-      if(end == -1) return("");
-      return StringSubstr(json, start, end - start);
-   }
-   else
-   {
-      int end = StringFind(json, ",", start);
-      if(end == -1) end = StringFind(json, "}", start);
-      if(end == -1) return("");
-      string value = StringSubstr(json, start, end - start);
-      StringTrimLeft(value);
-      StringTrimRight(value);
-      return value;
-   }
-}
-
-//--- Execute received trade
-void ExecuteTrade(string json)
-{
-   // Example JSON:
-   // {"symbol":"XAUUSD","volume":0.1,"type":0,"sl":1900.0,"tp":1950.0,"action":"OPEN"}
-
-   string symbol = GetJsonValue(json, "symbol");
-   double volume = StringToDouble(GetJsonValue(json, "volume"));
-   int type      = (int)StringToInteger(GetJsonValue(json, "type"));
-   double sl     = StringToDouble(GetJsonValue(json, "sl"));
-   double tp     = StringToDouble(GetJsonValue(json, "tp"));
-   string action = GetJsonValue(json, "action");
-
-   if(symbol == "" || volume <= 0 || action != "OPEN")
-   {
-      Print("⚠️ Invalid or unsupported trade signal: ", json);
-      return;
-   }
-
-   if(!SymbolSelect(symbol,true))
-   {
-      Print("⚠️ Symbol not available: ", symbol);
-      return;
-   }
-
-   MqlTradeRequest req;
-   MqlTradeResult res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action   = TRADE_ACTION_DEAL;
-   req.symbol   = symbol;
-   req.volume   = volume;
-   req.type     = (type==0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   req.price    = (type==0 ? SymbolInfoDouble(symbol,SYMBOL_ASK)
-                           : SymbolInfoDouble(symbol,SYMBOL_BID));
-   req.sl       = sl;
-   req.tp       = tp;
-   req.deviation= 10;
-   req.magic    = 123456;
-   req.type_filling = ORDER_FILLING_RETURN; // safer filling mode
-
-   if(!OrderSend(req,res))
-      Print("❌ OrderSend failed. Error: ", _LastError);
-   else
-      Print("✅ Executed trade from master. Order ID: ", res.order);
+   int pos = StringFind(json, "\"" + key + "\":");
+   if(pos == -1) return "";
+   int start = pos + StringLen(key) + 3; // skip key+quotes+colon
+   int end = StringFind(json, ",", start);
+   if(end == -1) end = StringFind(json, "}", start);
+   return StringSubstr(json,start,end-start);
 }

@@ -6,7 +6,6 @@
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
-#include <stdlib.mqh>
 
 //--- Settings
 input string BRIDGE_URL = "http://127.0.0.1:9000/events"; // local bridge
@@ -127,21 +126,22 @@ void HandleEvent(const string raw_event)
    else if(action=="CLOSE")
    {
       // Try to close positions matching master ticket by comment/magic/symbol
-      for(int i=PositionsTotal()-1;i>=0;i--)
+      CPositionInfo m_position;
+      for(int i=PositionsTotal()-1; i>=0; i--)
       {
-         if(PositionSelectByIndex(i))
+         if(m_position.SelectByIndex(i))
          {
-            string psym = PositionGetString(POSITION_SYMBOL);
-            long pmagic = PositionGetInteger(POSITION_MAGIC);
-            ulong p_ticket = PositionGetInteger(POSITION_TICKET);
+            string psym = m_position.Symbol();
+            long pmagic = m_position.Magic();
+            ulong p_ticket = m_position.Ticket();
             if(psym==symbol && pmagic==SLAVE_MAGIC)
             {
                ZeroMemory(req); ZeroMemory(res);
                req.action = TRADE_ACTION_DEAL;
                req.position = p_ticket;
-               long ptype = PositionGetInteger(POSITION_TYPE);
+               long ptype = m_position.PositionType();
                req.type = (ptype==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-               req.volume = PositionGetDouble(POSITION_VOLUME);
+               req.volume = m_position.Volume();
                req.symbol = symbol;
                req.price = (req.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
                req.deviation = 10;
@@ -158,17 +158,18 @@ void HandleEvent(const string raw_event)
    }
    else if(action=="MODIFY")
    {
+      CPositionInfo m_position;
       for(int i=PositionsTotal()-1;i>=0;i--)
       {
-         if(PositionSelectByIndex(i))
+         if(m_position.SelectByIndex(i))
          {
-            string psym = PositionGetString(POSITION_SYMBOL);
-            long pmagic = PositionGetInteger(POSITION_MAGIC);
-            ulong p_ticket = PositionGetInteger(POSITION_TICKET);
+            string psym = m_position.Symbol();
+            long pmagic = m_position.Magic();
+            ulong p_ticket = m_position.Ticket();
             if(psym==symbol && pmagic==SLAVE_MAGIC)
             {
-               double curSL = PositionGetDouble(POSITION_SL);
-               double curTP = PositionGetDouble(POSITION_TP);
+               double curSL = m_position.StopLoss();
+               double curTP = m_position.TakeProfit();
                if(curSL!=sl || curTP!=tp)
                {
                   ZeroMemory(req); ZeroMemory(res);

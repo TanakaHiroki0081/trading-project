@@ -207,6 +207,9 @@ void PollBridge()
    string response = CharArrayToUtf8String(result);
    if(StringLen(response) == 0) return;
 
+   // === Display the raw data received from the bridge ===
+   Print("Received from WebBridge: ", response);
+
    // Look for '"events":[' and extract the array
    int pos = StringFind(response, "\"events\":[");
    if(pos == -1) return;
